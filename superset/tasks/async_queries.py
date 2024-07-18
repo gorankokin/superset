@@ -19,6 +19,7 @@ from __future__ import annotations
 import copy
 import logging
 from typing import Any, cast, TYPE_CHECKING
+from datetime import datetime
 
 from celery.exceptions import SoftTimeLimitExceeded
 from flask import current_app, g
@@ -33,6 +34,7 @@ from superset.extensions import (
     celery_app,
     security_manager,
 )
+from superset.extensions import event_logger
 from superset.utils.cache import generate_cache_key, set_and_log_cache
 from superset.utils.core import override_user
 from superset.views.utils import get_datasource_info, get_viz
@@ -81,10 +83,21 @@ def load_chart_data_into_cache(
     # pylint: disable=import-outside-toplevel
     from superset.commands.chart.data.get_data_command import ChartDataCommand
 
+    start = datetime.now()
+    slice_id = None
+    dashboard_id = None
+
     with override_user(_load_user_from_job_metadata(job_metadata), force=False):
         try:
             set_form_data(form_data)
             query_context = _create_query_context_from_form(form_data)
+
+            if type(query_context.form_data) is dict:
+                if 'slice_id' in query_context.form_data:
+                    slice_id = query_context.form_data['slice_id']
+                if 'dashboardId' in query_context.form_data:
+                    dashboard_id = query_context.form_data['dashboardId']
+
             command = ChartDataCommand(query_context)
             result = command.run(cache=True)
             cache_key = result["cache_key"]
@@ -94,8 +107,42 @@ def load_chart_data_into_cache(
                 async_query_manager.STATUS_DONE,
                 result_url=result_url,
             )
+
+            duration = datetime.now() - start
+            action = "async_load.dashboard_slice.success"
+            if dashboard_id is not None and slice_id is None:
+                action = "async_load.native_filter.success"
+            elif dashboard_id is None and slice_id is not None:
+                action = "async_load.chart.success"
+            event_logger.log_with_context(
+                action=action,
+                duration=duration,
+                log_to_statsd=True,
+                request={"path": result_url},
+                form_data_extra=query_context.form_data,
+                dashboard_id=dashboard_id,
+                slice_id=slice_id,
+                task="load_chart_data_into_cache"
+            )
         except SoftTimeLimitExceeded as ex:
             logger.warning("A timeout occurred while loading chart data, error: %s", ex)
+
+            duration = datetime.now() - start
+            action = "async_load.dashboard_slice.fail.time_limit_exceeded"
+            if dashboard_id is not None and slice_id is None:
+                action = "async_load.native_filter.fail.time_limit_exceeded"
+            elif dashboard_id is None and slice_id is not None:
+                action = "async_load.chart.fail.time_limit_exceeded"
+            event_logger.log_with_context(
+                action=action,
+                duration=duration,
+                log_to_statsd=True,
+                form_data_extra=query_context.form_data,
+                dashboard_id=dashboard_id,
+                slice_id=slice_id,
+                task="load_chart_data_into_cache",
+                error=str(ex)
+            )
             raise ex
         except Exception as ex:
             # TODO: QueryContext should support SIP-40 style errors
@@ -103,6 +150,23 @@ def load_chart_data_into_cache(
             errors = [{"message": error}]
             async_query_manager.update_job(
                 job_metadata, async_query_manager.STATUS_ERROR, errors=errors
+            )
+
+            duration = datetime.now() - start
+            action = "async_load.dashboard_slice.fail.exception"
+            if dashboard_id is not None and slice_id is None:
+                action = "async_load.native_filter.fail.exception"
+            elif dashboard_id is None and slice_id is not None:
+                action = "async_load.chart.fail.exception"
+            event_logger.log_with_context(
+                action=action,
+                duration=duration,
+                log_to_statsd=True,
+                form_data_extra=query_context.form_data,
+                dashboard_id=dashboard_id,
+                slice_id=slice_id,
+                task="load_chart_data_into_cache",
+                error=str(ex)
             )
             raise ex
 
@@ -116,6 +180,10 @@ def load_explore_json_into_cache(  # pylint: disable=too-many-locals
 ) -> None:
     cache_key_prefix = "ejr-"  # ejr: explore_json request
 
+    start = datetime.now()
+    slice_id = None
+    dashboard_id = None
+
     with override_user(_load_user_from_job_metadata(job_metadata), force=False):
         try:
             set_form_data(form_data)
@@ -127,6 +195,12 @@ def load_explore_json_into_cache(  # pylint: disable=too-many-locals
             # to be cached here, it will lead to a cache miss when clients
             # attempt to retrieve the value of the completed async query.
             original_form_data = copy.deepcopy(form_data)
+
+            if form_data is not None:
+                if 'slice_id' in form_data:
+                    slice_id = form_data['slice_id']
+                if 'dashboardId' in form_data:
+                    dashboard_id = form_data['dashboardId']
 
             viz_obj = get_viz(
                 datasource_type=cast(str, datasource_type),
@@ -158,9 +232,43 @@ def load_explore_json_into_cache(  # pylint: disable=too-many-locals
                 async_query_manager.STATUS_DONE,
                 result_url=result_url,
             )
+
+            duration = datetime.now() - start
+            action = "async_load.dashboard_slice.success"
+            if dashboard_id is not None and slice_id is None:
+                action = "async_load.native_filter.success"
+            elif dashboard_id is None and slice_id is not None:
+                action = "async_load.chart.success"
+            event_logger.log_with_context(
+                action=action,
+                duration=duration,
+                log_to_statsd=True,
+                request={"path": result_url},
+                form_data_extra=form_data,
+                dashboard_id=dashboard_id,
+                slice_id=slice_id,
+                task="load_explore_json_into_cache"
+            )
         except SoftTimeLimitExceeded as ex:
             logger.warning(
                 "A timeout occurred while loading explore json, error: %s", ex
+            )
+
+            duration = datetime.now() - start
+            action = "async_load.dashboard_slice.fail.time_limit_exceeded"
+            if dashboard_id is not None and slice_id is None:
+                action = "async_load.native_filter.fail.time_limit_exceeded"
+            elif dashboard_id is None and slice_id is not None:
+                action = "async_load.chart.fail.time_limit_exceeded"
+            event_logger.log_with_context(
+                action=action,
+                duration=duration,
+                log_to_statsd=True,
+                form_data_extra=form_data,
+                dashboard_id=dashboard_id,
+                slice_id=slice_id,
+                task="load_explore_json_into_cache",
+                error=str(ex)
             )
             raise ex
         except Exception as ex:
@@ -172,5 +280,22 @@ def load_explore_json_into_cache(  # pylint: disable=too-many-locals
 
             async_query_manager.update_job(
                 job_metadata, async_query_manager.STATUS_ERROR, errors=errors
+            )
+
+            duration = datetime.now() - start
+            action = "async_load.dashboard_slice.fail.exception"
+            if dashboard_id is not None and slice_id is None:
+                action = "async_load.native_filter.fail.exception"
+            elif dashboard_id is None and slice_id is not None:
+                action = "async_load.chart.fail.exception"
+            event_logger.log_with_context(
+                action=action,
+                duration=duration,
+                log_to_statsd=True,
+                form_data_extra=form_data,
+                dashboard_id=dashboard_id,
+                slice_id=slice_id,
+                task="load_explore_json_into_cache",
+                error=str(ex)
             )
             raise ex

@@ -263,6 +263,10 @@ class Superset(BaseSupersetView):
     def explore_json(
         self, datasource_type: str | None = None, datasource_id: int | None = None
     ) -> FlaskResponse:
+        start = datetime.now()
+        slice_id = None
+        dashboard_id = None
+
         """Serves all request that GET or POST form_data
 
         This endpoint evolved to be the entry point of many different
@@ -294,6 +298,13 @@ class Superset(BaseSupersetView):
             )
 
         form_data = get_form_data()[0]
+
+        if type(form_data) is dict:
+            if 'slice_id' in form_data:
+                slice_id = form_data['slice_id']
+            if 'dashboardId' in form_data:
+                dashboard_id = form_data['dashboardId']
+
         try:
             datasource_id, datasource_type = get_datasource_info(
                 datasource_id, datasource_type, form_data
@@ -317,6 +328,16 @@ class Superset(BaseSupersetView):
                     payload = viz_obj.get_payload()
                     # If the chart query has already been cached, return it immediately.
                     if payload is not None:
+                        duration = datetime.now() - start
+                        event_logger.log_with_context(
+                            action="sync_load.viz.success",
+                            duration=duration,
+                            log_to_statsd=True,
+                            form_data_extra=form_data,
+                            dashboard_id=dashboard_id,
+                            slice_id=slice_id
+                        )
+
                         return self.send_data_payload_response(viz_obj, payload)
                 # Otherwise, kick off a background job to run the chart query.
                 # Clients will either poll or be notified of query completion,
@@ -341,8 +362,29 @@ class Superset(BaseSupersetView):
                 force=force,
             )
 
+            duration = datetime.now() - start
+            event_logger.log_with_context(
+                action="sync_load.viz.success",
+                duration=duration,
+                log_to_statsd=True,
+                form_data_extra=form_data,
+                dashboard_id=dashboard_id,
+                slice_id=slice_id
+            )
+
             return self.generate_json(viz_obj, response_type)
         except SupersetException as ex:
+            duration = datetime.now() - start
+            event_logger.log_with_context(
+                action="sync_load.viz.fail.superset_exception",
+                duration=duration,
+                log_to_statsd=True,
+                form_data_extra=form_data,
+                dashboard_id=dashboard_id,
+                slice_id=slice_id,
+                error=str(ex)
+            )
+
             return json_error_response(utils.error_msg_from_exception(ex), 400)
 
     @staticmethod

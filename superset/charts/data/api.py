@@ -20,6 +20,7 @@ import contextlib
 import json
 import logging
 from typing import Any, TYPE_CHECKING
+from datetime import datetime
 
 import simplejson
 from flask import current_app, g, make_response, request, Response
@@ -168,7 +169,7 @@ class ChartDataRestApi(ChartRestApi):
             and query_context.result_format == ChartDataResultFormat.JSON
             and query_context.result_type == ChartDataResultType.FULL
         ):
-            return self._run_async(json_body, command)
+            return self._run_async(json_body, command, query_context)
 
         try:
             form_data = json.loads(chart.params)
@@ -176,7 +177,10 @@ class ChartDataRestApi(ChartRestApi):
             form_data = {}
 
         return self._get_data_response(
-            command=command, form_data=form_data, datasource=query_context.datasource
+            command=command,
+            form_data=form_data,
+            datasource=query_context.datasource,
+            query_context=query_context
         )
 
     @expose("/data", methods=("POST",))
@@ -256,11 +260,14 @@ class ChartDataRestApi(ChartRestApi):
             and query_context.result_format == ChartDataResultFormat.JSON
             and query_context.result_type == ChartDataResultType.FULL
         ):
-            return self._run_async(json_body, command)
+            return self._run_async(json_body, command, query_context)
 
         form_data = json_body.get("form_data")
         return self._get_data_response(
-            command, form_data=form_data, datasource=query_context.datasource
+            command=command,
+            form_data=form_data,
+            datasource=query_context.datasource,
+            query_context=query_context
         )
 
     @expose("/data/<cache_key>", methods=("GET",))
@@ -319,19 +326,49 @@ class ChartDataRestApi(ChartRestApi):
                 message=_("Request is incorrect: %(error)s", error=error.messages)
             )
 
-        return self._get_data_response(command, True)
+        return self._get_data_response(
+            command=command,
+            force_cached=True,
+            query_context=query_context
+        )
 
     def _run_async(
-        self, form_data: dict[str, Any], command: ChartDataCommand
+        self, form_data: dict[str, Any], command: ChartDataCommand, query_context: QueryContext
     ) -> Response:
+        start = datetime.now()
+        slice_id = None
+        dashboard_id = None
+
         """
         Execute command as an async query.
         """
-        # First, look for the chart query results in the cache.
-        with contextlib.suppress(ChartDataCacheLoadError):
-            result = command.run(force_cached=True)
-            if result is not None:
-                return self._send_chart_response(result)
+        # If not forced, First look for the chart query results in the cache.
+        if not query_context.force:
+            if type(query_context.form_data) is dict:
+                if 'slice_id' in query_context.form_data:
+                    slice_id = query_context.form_data['slice_id']
+                if 'dashboardId' in query_context.form_data:
+                    dashboard_id = query_context.form_data['dashboardId']
+
+            with contextlib.suppress(ChartDataCacheLoadError):
+                result = command.run(force_cached=True)
+                if result is not None:
+                    duration = datetime.now() - start
+                    action = "sync_load.dashboard_slice.success"
+                    if dashboard_id is not None and slice_id is None:
+                        action = "sync_load.native_filter.success"
+                    elif dashboard_id is None and slice_id is not None:
+                        action = "sync_load.chart.success"
+                    event_logger.log_with_context(
+                        action=action,
+                        duration=duration,
+                        log_to_statsd=True,
+                        form_data_extra=query_context.form_data,
+                        dashboard_id=dashboard_id,
+                        slice_id=slice_id
+                    )
+
+                    return self._send_chart_response(result)
         # Otherwise, kick off a background job to run the chart query.
         # Clients will either poll or be notified of query completion,
         # at which point they will call the /data/<cache_key> endpoint
@@ -413,12 +450,73 @@ class ChartDataRestApi(ChartRestApi):
         force_cached: bool = False,
         form_data: dict[str, Any] | None = None,
         datasource: BaseDatasource | Query | None = None,
+        query_context: QueryContext | None = None
     ) -> Response:
+        start = datetime.now()
+        slice_id = None
+        dashboard_id = None
+
         try:
+            if type(query_context.form_data) is dict:
+                if 'slice_id' in query_context.form_data:
+                    slice_id = query_context.form_data['slice_id']
+                if 'dashboardId' in query_context.form_data:
+                    dashboard_id = query_context.form_data['dashboardId']
+
             result = command.run(force_cached=force_cached)
+
+            if not force_cached:
+                duration = datetime.now() - start
+                action = "sync_load.dashboard_slice.success"
+                if dashboard_id is not None and slice_id is None:
+                    action = "sync_load.native_filter.success"
+                elif dashboard_id is None and slice_id is not None:
+                    action = "sync_load.chart.success"
+                event_logger.log_with_context(
+                    action=action,
+                    duration=duration,
+                    log_to_statsd=True,
+                    form_data_extra=query_context.form_data,
+                    dashboard_id=dashboard_id,
+                    slice_id=slice_id
+                )
         except ChartDataCacheLoadError as exc:
+            if not force_cached:
+                duration = datetime.now() - start
+                action = "sync_load.dashboard_slice.fail.cache_load_exception"
+                if dashboard_id is not None and slice_id is None:
+                    action = "sync_load.native_filter.fail.cache_load_exception"
+                elif dashboard_id is None and slice_id is not None:
+                    action = "sync_load.chart.fail.cache_load_exception"
+                event_logger.log_with_context(
+                    action=action,
+                    duration=duration,
+                    log_to_statsd=True,
+                    form_data_extra=query_context.form_data,
+                    dashboard_id=dashboard_id,
+                    slice_id=slice_id,
+                    error=str(exc)
+                )
+
             return self.response_422(message=exc.message)
         except ChartDataQueryFailedError as exc:
+            if not force_cached:
+                duration = datetime.now() - start
+                action = "sync_load.dashboard_slice.fail.query_exception"
+                if dashboard_id is not None and slice_id is None:
+                    action = "sync_load.native_filter.fail.query_exception"
+                elif dashboard_id is None and slice_id is not None:
+                    action = "sync_load.chart.fail.query_exception"
+                event_logger.log_with_context(
+                    action=action,
+                    duration=duration,
+                    log_to_statsd=True,
+                    form_data_extra=query_context.form_data,
+                    dashboard_id=dashboard_id,
+                    slice_id=slice_id,
+                    error=str(exc)
+                )
+
             return self.response_400(message=exc.message)
 
         return self._send_chart_response(result, form_data, datasource)

@@ -42,7 +42,7 @@ from superset.dataframe import df_to_records
 from superset.db_engine_specs import BaseEngineSpec
 from superset.errors import ErrorLevel, SupersetError, SupersetErrorType
 from superset.exceptions import SupersetErrorException, SupersetErrorsException
-from superset.extensions import celery_app
+from superset.extensions import celery_app, event_logger
 from superset.models.core import Database
 from superset.models.sql_lab import Query
 from superset.result_set import SupersetResultSet
@@ -196,6 +196,9 @@ def execute_sql_statement(
     apply_ctas: bool = False,
 ) -> SupersetResultSet:
     """Executes a single SQL statement"""
+    start = datetime.now()
+    serializable_query = None
+
     database: Database = query.database
     db_engine_spec = database.db_engine_spec
 
@@ -265,6 +268,12 @@ def execute_sql_statement(
         security_manager=security_manager,
         database=database,
     )
+
+    try:
+        serializable_query = json.loads(json.dumps(query.to_dict(), default=lambda o: '<not serializable>'))
+    except:
+        pass
+
     try:
         query.executed_sql = sql
         if log_query:
@@ -297,6 +306,17 @@ def execute_sql_statement(
 
         logger.warning("Query %d: Time limit exceeded", query.id)
         logger.debug("Query %d: %s", query.id, ex)
+
+        duration = datetime.now() - start
+        event_logger.log_with_context(
+            action="async_load.sql_lab_query.fail.time_limit_exceeded",
+            duration=duration,
+            log_to_statsd=True,
+            query=serializable_query,
+            task="sql_lab.get_sql_results",
+            error=str(ex)
+        )
+
         raise SupersetErrorException(
             SupersetError(
                 message=__(
@@ -312,14 +332,45 @@ def execute_sql_statement(
         # query is stopped in another thread/worker
         # stopping raises expected exceptions which we should skip
         db.session.refresh(query)
+
+        duration = datetime.now() - start
         if query.status == QueryStatus.STOPPED:
+            event_logger.log_with_context(
+                action="async_load.sql_lab_query.fail.query_stopped",
+                duration=duration,
+                log_to_statsd=True,
+                query=serializable_query,
+                task="sql_lab.get_sql_results",
+                error=str(ex)
+            )
+
             raise SqlLabQueryStoppedException() from ex
 
         logger.debug("Query %d: %s", query.id, ex)
+
+        event_logger.log_with_context(
+            action="async_load.sql_lab_query.fail.exception",
+            duration=duration,
+            log_to_statsd=True,
+            query=serializable_query,
+            task="sql_lab.get_sql_results",
+            error=str(ex)
+        )
+
         raise SqlLabException(db_engine_spec.extract_error_message(ex)) from ex
 
     logger.debug("Query %d: Fetching cursor description", query.id)
     cursor_description = cursor.description
+
+    duration = datetime.now() - start
+    event_logger.log_with_context(
+        action="async_load.sql_lab_query.success",
+        duration=duration,
+        log_to_statsd=True,
+        query=serializable_query,
+        task="sql_lab.get_sql_results"
+    )
+
     return SupersetResultSet(data, cursor_description, db_engine_spec)
 
 
